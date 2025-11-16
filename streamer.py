@@ -1,4 +1,5 @@
 import cv2
+import os
 import random
 from loguru import logger
 from ultralytics import YOLO
@@ -40,6 +41,50 @@ class YoloByteTrackStreamer:
             )
         return self.track_id_colors[track_id]
 
+    def _draw_pretty_box(self, frame, bbox, class_name, track_id, conf, color):
+        """
+        Draw a semi-transparent box with a nice label bar.
+        """
+        x1, y1, x2, y2 = map(int, bbox)
+
+        # --- NEW: semi-transparent filled box overlay ---
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)  # filled rect
+        alpha = 0.2  # transparency factor
+        frame[:] = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+
+        # --- CHANGED: thinner solid border (for cleaner look) ---
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        # --- NEW: label text (class name + confidence + track ID) ---
+        label = f"{class_name} {conf:.2f}  ID:{track_id}"
+
+        (tw, th), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+        )
+
+        # --- NEW: label bar above the box ---
+        label_x1 = x1
+        label_y1 = max(0, y1 - th - 8)
+        label_x2 = x1 + tw + 8
+        label_y2 = y1
+
+        # NEW: darker version of box color for label background
+        bg_color = (int(color[0] * 0.4), int(color[1] * 0.4), int(color[2] * 0.4))
+        cv2.rectangle(frame, (label_x1, label_y1), (label_x2, label_y2), bg_color, -1)
+
+        # NEW: white text on top of colored bar
+        cv2.putText(
+            frame,
+            label,
+            (label_x1 + 4, label_y2 - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
     def run(self, 
             source: int | str, 
             target_classes=None, 
@@ -61,8 +106,19 @@ class YoloByteTrackStreamer:
         # Setup video writer if output path is not None
         out = None
         if output_path is not None:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            output_path = os.path.abspath(output_path)
+            out_dir = os.path.dirname(output_path)
+            if out_dir and not os.path.exists(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+            if not out.isOpened():
+                logger.error(f"Failed to open VideoWriter for: {output_path}")
+                out = None
+            else:
+                logger.info(f"Output video will be saved to: {output_path}")
 
         # Reset colors for each run
         self.track_id_colors = {}
@@ -83,6 +139,7 @@ class YoloByteTrackStreamer:
             if result.boxes is not None and len(result.boxes) > 0:
                 bboxes = result.boxes.xyxy.cpu().tolist()
                 class_ids = result.boxes.cls.int().cpu().tolist()
+                confs = result.boxes.conf.cpu().tolist()
 
                 ids = result.boxes.id
                 if ids is not None:
@@ -91,7 +148,7 @@ class YoloByteTrackStreamer:
                     # If tracker didn't assign IDs, use -1 for "untracked"
                     track_ids = [-1] * len(bboxes)
 
-                for track_id, bbox, cls_id in zip(track_ids, bboxes, class_ids):
+                for track_id, bbox, cls_id, conf in zip(track_ids, bboxes, class_ids, confs):
                     # Filter by target classes if specified
                     if target_classes is not None and cls_id not in target_classes:
                         continue
@@ -103,26 +160,14 @@ class YoloByteTrackStreamer:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
 
                     # Label text
-                    text = f"ID:{track_id} CLS:{cls_id}"
-                    (tw, th), baseline = cv2.getTextSize(
-                        text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
-                    )
-
-                    bg_x1 = x1
-                    bg_y1 = y1 - 10 - th
-                    bg_x2 = x1 + tw
-                    bg_y2 = y1 - 10 + baseline
-
-                    bg_y1 = max(0, bg_y1)
-                    bg_y2 = min(frame.shape[0], bg_y2)
-
-                    # White background for text
-                    cv2.rectangle(frame, (bg_x1, bg_y1), (bg_x2, bg_y2), (255, 255, 255), -1)
-                    cv2.putText(
-                        frame, text,
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7, color, 2
+                    class_name = self.model.names[int(cls_id)] # Convert class ID → class name
+                    self._draw_pretty_box(
+                        frame=frame,
+                        bbox=bbox,
+                        class_name=class_name,
+                        track_id=track_id,
+                        conf=conf,
+                        color=color,
                     )
 
             # Show frame
