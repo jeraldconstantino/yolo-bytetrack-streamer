@@ -1,7 +1,7 @@
 from streamer import YoloByteTrackStreamer
 
 streamer = YoloByteTrackStreamer(
-    model_path="yolov8n.pt",  # or "yolov8x.pt"
+    model_path="models/yolov8m.pt",  # or "yolov8x.pt"
     device="cpu"
 )
 

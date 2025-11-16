@@ -6,7 +6,7 @@ from ultralytics import YOLO
 
 
 class YoloByteTrackStreamer:
-    def __init__(self, model_path: str = "yolov8n.pt", device: str = "cpu"):
+    def __init__(self, model_path: str = "models/yolov8n.pt", device: str = "cpu"):
         """
         model_path (str): path or name of the YOLO model (e.g. 'yolov8n.pt', 'yolov8x.pt')
         device (str): 'cpu' or 'cuda'
@@ -14,7 +14,9 @@ class YoloByteTrackStreamer:
         self.window_name = "ShopSight Object Detection and Tracking"
         self.model = YOLO(model_path)
         self.device = device
-        self.track_id_colors = {}  # persistent across frames
+        self.track_id_colors = {}  # Persistent across frames
+        self.display_id_map: dict[int, int] = {}  
+        self.next_display_id: int = 1              
 
     def _get_video_properties(self, source: int | str) -> tuple[float, int, int]:
         """Open the source once to get fps, width, height."""
@@ -41,6 +43,18 @@ class YoloByteTrackStreamer:
             )
         return self.track_id_colors[track_id]
 
+    def _get_display_id(self, raw_id: int) -> int:
+        """
+        Map tracker raw_id to a small sequential display id (1,2,3,...).
+        If raw_id is -1 (untracked), keep it as -1.
+        """
+        if raw_id == -1:
+            return -1
+        if raw_id not in self.display_id_map:
+            self.display_id_map[raw_id] = self.next_display_id
+            self.next_display_id += 1
+        return self.display_id_map[raw_id]
+
     def _adaptive_font(self, frame, base_scale=0.6):
         """
         Automatically scale font depending on resolution.
@@ -50,11 +64,7 @@ class YoloByteTrackStreamer:
 
         # Reference resolution for base scaling: 1920×1080
         scale_factor = (w * h) / (1920 * 1080)
-
-        # Square root keeps scaling gentle & natural-looking
         adaptive = base_scale * (scale_factor ** 0.5)
-
-        # Clamp values to avoid extremes
         adaptive = max(0.5, min(adaptive, 2.0))
         return adaptive
 
@@ -226,6 +236,8 @@ class YoloByteTrackStreamer:
 
         # Reset colors for each run
         self.track_id_colors = {}
+        self.display_id_map = {}
+        self.next_display_id = 1     
 
         # Start tracking stream
         results = self.model.track(
@@ -240,7 +252,7 @@ class YoloByteTrackStreamer:
         for frame_id, result in enumerate(results):
             frame = result.orig_img.copy()
 
-            # per-frame counts
+            # Per-frame counts
             class_counts: dict[str, int] = {}
 
             if result.boxes is not None and len(result.boxes) > 0:
@@ -254,21 +266,24 @@ class YoloByteTrackStreamer:
                 else:
                     track_ids = [-1] * len(bboxes)
 
-                for track_id, bbox, cls_id, conf in zip(
-                    track_ids, bboxes, class_ids, confs
-                ):
+                for track_id, bbox, cls_id, conf in zip(track_ids, bboxes, class_ids, confs):
                     if target_classes is not None and cls_id not in target_classes:
                         continue
 
                     class_name = self.model.names[int(cls_id)]
                     class_counts[class_name] = class_counts.get(class_name, 0) + 1
+
+                    display_id = self._get_display_id(track_id)
+
+                    # Keep raw track_id for color consistency
                     color = self._get_color_for_track(track_id)
 
+                    # Pass display_id to the drawing function
                     self._draw_bounding_box(
                         frame=frame,
                         bbox=bbox,
                         class_name=class_name,
-                        track_id=track_id,
+                        track_id=display_id, 
                         conf=conf,
                         color=color,
                     )
@@ -279,11 +294,11 @@ class YoloByteTrackStreamer:
             # Only show window if enabled
             if show_window_effective:
                 cv2.imshow(self.window_name, frame)
-                # allow user to quit with 'q' only when window exists
+                # Allow user to quit with 'q' only when window exists
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
             else:
-                # headless mode: no imshow, no popup
+                # Headless mode: no imshow, no popup
                 pass
 
             # Save if writer is enabled
