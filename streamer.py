@@ -41,6 +41,23 @@ class YoloByteTrackStreamer:
             )
         return self.track_id_colors[track_id]
 
+    def _adaptive_font(self, frame, base_scale=0.6):
+        """
+        Automatically scale font depending on resolution.
+        base_scale: the default scale for 1080p
+        """
+        h, w, _ = frame.shape
+
+        # Reference resolution for base scaling: 1920×1080
+        scale_factor = (w * h) / (1920 * 1080)
+
+        # Square root keeps scaling gentle & natural-looking
+        adaptive = base_scale * (scale_factor ** 0.5)
+
+        # Clamp values to avoid extremes
+        adaptive = max(0.5, min(adaptive, 2.0))
+        return adaptive
+
     def _draw_bounding_box(self, 
                            frame,
                            bbox,
@@ -55,41 +72,40 @@ class YoloByteTrackStreamer:
 
         x1, y1, x2, y2 = map(int, bbox)
 
-        # bounding box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        # Adaptive font size
+        font_scale = self._adaptive_font(frame, base_scale=0.8)    
+        thickness = int(font_scale * 2)                             
+        box_thickness = max(2, int(font_scale * 3))       
+        
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, box_thickness)
 
-        # label text
-        label = f"#{track_id} {class_name} {conf:.2f}"
+        label = f"{class_name} #{track_id} {conf:.2f}"
 
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.6
-        label_thickness = 2
+        (tw, th), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+        )
 
-        (tw, th), baseline = cv2.getTextSize(label, font, font_scale, label_thickness)
-
-        # label background
+        # Label background
         label_x1 = x1
-        label_y2 = max(y1, th + 8)
-        label_y1 = label_y2 - th - 8
-        label_x2 = x1 + tw + 8
+        label_y2 = max(y1, th + 10)
+        label_y1 = label_y2 - th - 10
+        label_x2 = x1 + tw + 10
 
-        # filled rectangle (same as box color)
         cv2.rectangle(frame, (label_x1, label_y1), (label_x2, label_y2), color, -1)
 
-        # Dynamic text color based on luminance 
+        # Adjust text color based on luminance
         R, G, B = color
         luminance = 0.299 * R + 0.587 * G + 0.114 * B
         text_color = (0, 0, 0) if luminance > 128 else (255, 255, 255)
 
-        # Draw text
         cv2.putText(
             frame,
             label,
-            (label_x1 + 4, label_y2 - 4),
-            font,
+            (label_x1 + 5, label_y2 - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
             font_scale,
             text_color,
-            label_thickness,
+            thickness,
             cv2.LINE_AA,
         )
 
@@ -106,46 +122,41 @@ class YoloByteTrackStreamer:
 
         h, w, _ = frame.shape
 
-        # build lines: header + each class
+        # Adaptive text size for panel
+        font_scale = self._adaptive_font(frame, base_scale=0.8)
+        thickness = int(font_scale * 2)
+
         lines = ["Objects"]
         for name, cnt in class_counts.items():
             lines.append(f"{name}: {cnt}")
 
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.6
-        thickness = 2
-        margin = 10
-        line_spacing = 6
+        margin = int(12 * font_scale)
+        spacing = int(8 * font_scale)
 
-        # compute panel size
-        text_sizes = [
-            cv2.getTextSize(line, font, font_scale, thickness)[0] for line in lines
-        ]
-        max_text_w = max(ts[0] for ts in text_sizes)
-        text_h = max(ts[1] for ts in text_sizes)
+        text_sizes = [cv2.getTextSize(line, font, font_scale, thickness)[0]
+                      for line in lines]
 
-        panel_w = max_text_w + 2 * margin
-        panel_h = len(lines) * (text_h + line_spacing) + 2 * margin - line_spacing
+        max_w = max(t[0] for t in text_sizes)
+        text_h = max(t[1] for t in text_sizes)
+
+        panel_w = max_w + margin * 2
+        panel_h = len(lines) * (text_h + spacing) + margin * 2 - spacing
 
         x2 = w - 10
         x1 = x2 - panel_w
         y1 = 10
         y2 = y1 + panel_h
 
-        # semi-transparent dark background
+        # Semi-transparent dark panel
         overlay = frame.copy()
-        panel_color = (0, 0, 0)
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), panel_color, -1)
-        alpha = 0.4
-        frame[:] = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
+        frame[:] = cv2.addWeighted(overlay, 0.4, frame, 0.6, 0)
 
-        # draw text lines
+        # Draw lines
         y = y1 + margin + text_h
         for i, line in enumerate(lines):
-            if i == 0:
-                color = (0, 255, 255)  # header color
-            else:
-                color = (255, 255, 255)
+            color = (0, 255, 255) if i == 0 else (255, 255, 255)
             cv2.putText(
                 frame,
                 line,
@@ -156,7 +167,7 @@ class YoloByteTrackStreamer:
                 thickness,
                 cv2.LINE_AA,
             )
-            y += text_h + line_spacing
+            y += text_h + spacing
 
     def run(
         self,
@@ -262,7 +273,7 @@ class YoloByteTrackStreamer:
                         color=color,
                     )
 
-            # draw upper-right counts panel
+            # Draw upper-right counts panel
             self._draw_counts_panel(frame, class_counts)
 
             # Only show window if enabled
