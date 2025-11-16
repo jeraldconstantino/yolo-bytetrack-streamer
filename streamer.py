@@ -41,52 +41,130 @@ class YoloByteTrackStreamer:
             )
         return self.track_id_colors[track_id]
 
-    def _draw_bounding_box(self, frame, bbox, class_name, track_id, conf, color):
-        """Draw a semi-transparent box with a nice label bar."""
+    def _draw_bounding_box(self, 
+                           frame,
+                           bbox,
+                           class_name: str,
+                           track_id: int,
+                           conf: float,
+                           color: tuple[int, int, int]):
+        """
+        Draws a solid bounding box with a colored label bar:
+        '#ID class_name conf'
+        """
+
         x1, y1, x2, y2 = map(int, bbox)
 
-        # semi-transparent filled box overlay
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)  # filled rect
-        alpha = 0.2  # transparency factor
-        frame[:] = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
-
-        # thinner solid border
+        # bounding box
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        # label text (class name + confidence + track ID)
-        label = f"{class_name} {conf:.2f}  ID:{track_id}"
+        # label text
+        label = f"#{track_id} {class_name} {conf:.2f}"
 
-        (tw, th), baseline = cv2.getTextSize(
-            label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
-        )
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        label_thickness = 2
 
-        # label bar above the box
+        (tw, th), baseline = cv2.getTextSize(label, font, font_scale, label_thickness)
+
+        # label background
         label_x1 = x1
-        label_y1 = max(0, y1 - th - 8)
+        label_y2 = max(y1, th + 8)
+        label_y1 = label_y2 - th - 8
         label_x2 = x1 + tw + 8
-        label_y2 = y1
 
-        # darker version of box color for label background
-        bg_color = (int(color[0] * 0.4), int(color[1] * 0.4), int(color[2] * 0.4))
-        cv2.rectangle(frame, (label_x1, label_y1), (label_x2, label_y2), bg_color, -1)
+        # filled rectangle (same as box color)
+        cv2.rectangle(frame, (label_x1, label_y1), (label_x2, label_y2), color, -1)
 
-        # white text on top of colored bar
+        # Dynamic text color based on luminance 
+        R, G, B = color
+        luminance = 0.299 * R + 0.587 * G + 0.114 * B
+        text_color = (0, 0, 0) if luminance > 128 else (255, 255, 255)
+
+        # Draw text
         cv2.putText(
             frame,
             label,
             (label_x1 + 4, label_y2 - 4),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
+            font,
+            font_scale,
+            text_color,
+            label_thickness,
             cv2.LINE_AA,
         )
 
-    def run(self, 
-            source: int | str, 
-            target_classes=None, 
-            output_path=None):
+    def _draw_counts_panel(self, frame, class_counts: dict[str, int]):
+        """
+        Draws a semi-transparent panel in the upper-right with per-class counts,
+        e.g.:
+            Objects
+            person: 3
+            car: 2
+        """
+        if not class_counts:
+            return
+
+        h, w, _ = frame.shape
+
+        # build lines: header + each class
+        lines = ["Objects"]
+        for name, cnt in class_counts.items():
+            lines.append(f"{name}: {cnt}")
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        thickness = 2
+        margin = 10
+        line_spacing = 6
+
+        # compute panel size
+        text_sizes = [
+            cv2.getTextSize(line, font, font_scale, thickness)[0] for line in lines
+        ]
+        max_text_w = max(ts[0] for ts in text_sizes)
+        text_h = max(ts[1] for ts in text_sizes)
+
+        panel_w = max_text_w + 2 * margin
+        panel_h = len(lines) * (text_h + line_spacing) + 2 * margin - line_spacing
+
+        x2 = w - 10
+        x1 = x2 - panel_w
+        y1 = 10
+        y2 = y1 + panel_h
+
+        # semi-transparent dark background
+        overlay = frame.copy()
+        panel_color = (0, 0, 0)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), panel_color, -1)
+        alpha = 0.4
+        frame[:] = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+
+        # draw text lines
+        y = y1 + margin + text_h
+        for i, line in enumerate(lines):
+            if i == 0:
+                color = (0, 255, 255)  # header color
+            else:
+                color = (255, 255, 255)
+            cv2.putText(
+                frame,
+                line,
+                (x1 + margin, y),
+                font,
+                font_scale,
+                color,
+                thickness,
+                cv2.LINE_AA,
+            )
+            y += text_h + line_spacing
+
+    def run(
+        self,
+        source: int | str,
+        target_classes = None,
+        output_path = None,
+        show_window: bool | None = None,
+    ):
         """
         source:
             int -> camera index (0 = default webcam)
@@ -95,8 +173,25 @@ class YoloByteTrackStreamer:
             list of COCO class IDs to keep (e.g., [0, 32]) or None for all.
         output_path:
             if not None, saves the annotated video to this file path.
+        show_window: bool | None
+            If None (default), decide automatically:
+                - camera (int)      -> True  (show)
+                - video file (.mp4) -> False (headless)
+            If True/False, override behavior.
         """
         logger.info(f"Starting stream from source: {source}")
+
+        if show_window is None:
+            if isinstance(source, int):
+                show_window_effective = True           # webcam → show
+            elif isinstance(source, str) and source.lower().endswith(
+                (".mp4", ".avi", ".mov", ".mkv")
+            ):
+                show_window_effective = False          # video file → headless
+            else:
+                show_window_effective = True           # RTSP/HTTP/etc → show
+        else:
+            show_window_effective = show_window
 
         # Get video properties for optional writer
         fps, width, height = self._get_video_properties(source)
@@ -134,7 +229,7 @@ class YoloByteTrackStreamer:
         for frame_id, result in enumerate(results):
             frame = result.orig_img.copy()
 
-            # Reset counts for this frame
+            # per-frame counts
             class_counts: dict[str, int] = {}
 
             if result.boxes is not None and len(result.boxes) > 0:
@@ -146,20 +241,18 @@ class YoloByteTrackStreamer:
                 if ids is not None:
                     track_ids = ids.int().cpu().tolist()
                 else:
-                    # If tracker didn't assign IDs, use -1 for "untracked"
                     track_ids = [-1] * len(bboxes)
 
-                for track_id, bbox, cls_id, conf in zip(track_ids, bboxes, class_ids, confs):
-                    # Filter by target classes if specified
+                for track_id, bbox, cls_id, conf in zip(
+                    track_ids, bboxes, class_ids, confs
+                ):
                     if target_classes is not None and cls_id not in target_classes:
                         continue
 
-                    # Count this object by its class name
-                    class_name = self.model.names[int(cls_id)]  # Convert class ID → class name
+                    class_name = self.model.names[int(cls_id)]
                     class_counts[class_name] = class_counts.get(class_name, 0) + 1
-
-                    # Draw bounding box + label
                     color = self._get_color_for_track(track_id)
+
                     self._draw_bounding_box(
                         frame=frame,
                         bbox=bbox,
@@ -169,37 +262,28 @@ class YoloByteTrackStreamer:
                         color=color,
                     )
 
-            # Draw class counts in upper-left corner
-            if class_counts:
-                y0 = 30
-                dy = 22
-                for i, (name, count) in enumerate(class_counts.items()):
-                    text = f"{name}: {count}"
-                    cv2.putText(
-                        frame,
-                        text,
-                        (10, y0 + i * dy),  # (x, y)
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 255, 0),  # green text
-                        2,
-                        cv2.LINE_AA,
-                    )
+            # draw upper-right counts panel
+            self._draw_counts_panel(frame, class_counts)
 
-            # Show frame
-            cv2.imshow(self.window_name, frame)
+            # Only show window if enabled
+            if show_window_effective:
+                cv2.imshow(self.window_name, frame)
+                # allow user to quit with 'q' only when window exists
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+            else:
+                # headless mode: no imshow, no popup
+                pass
 
             # Save if writer is enabled
             if out is not None:
                 out.write(frame)
 
-            # Quit on 'q'
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
         if out is not None:
             out.release()
             logger.info(f"Output video saved to {output_path}")
 
-        cv2.destroyAllWindows()
+        if show_window_effective:
+            cv2.destroyAllWindows()
+
         logger.info("Stream ended.")
